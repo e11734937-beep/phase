@@ -22445,3 +22445,199 @@ fn static_self_and_enchanted_each_repeated_dynamic_pump() {
     );
     assert!(counts_auras, "the other term must count Auras you control");
 }
+
+/// CR 608.2d + CR 613.1f: The keyword-loss building block
+/// (`parse_continuous_modifications`) owns only the " and " conjunction — a
+/// genuine remove-ALL ("loses first strike and swampwalk" strips BOTH). The
+/// disjunctive " or " loss form is a player CHOICE (Urborg: "loses first strike
+/// or swampwalk" — the target loses only the ONE chosen ability) and is routed
+/// upstream in the effect parser to a persisted `ChoiceType::Keyword` +
+/// `RemoveChosenKeyword` (see `urborg_loses_first_strike_or_swampwalk_parses_end_to_end`).
+/// This building block must therefore emit NO unconditional removal for the
+/// " or " form: `split_keyword_list` leaves the whole "A or B" phrase intact and
+/// `map_keyword` rejects it, so the disjunctive clause yields an empty result
+/// here. The " and " conjunction is asserted unchanged (still two removals).
+#[test]
+fn loses_keyword_or_form_is_not_an_unconditional_removal_here() {
+    // " or " disjunction: this building block emits NO removal (the choice is
+    // handled upstream). Zero unconditional `RemoveKeyword` mods.
+    let or_mods = parse_continuous_modifications("loses first strike or swampwalk");
+    assert!(
+        !or_mods
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::RemoveKeyword { .. })),
+        "the \" or \" loss form is a choice (routed upstream) — it must NOT emit an \
+         unconditional RemoveKeyword here, got {or_mods:?}"
+    );
+
+    // " and " conjunction: a genuine remove-ALL — exactly two RemoveKeyword mods.
+    let and_mods = parse_continuous_modifications("loses first strike and swampwalk");
+    assert!(
+        and_mods.contains(&ContinuousModification::RemoveKeyword {
+            keyword: Keyword::FirstStrike,
+        }),
+        "expected RemoveKeyword(FirstStrike) from the \" and \" form, got {and_mods:?}"
+    );
+    assert!(
+        and_mods.contains(&ContinuousModification::RemoveKeyword {
+            keyword: Keyword::Landwalk("Swamp".to_string()),
+        }),
+        "expected RemoveKeyword(Landwalk(Swamp)) from the \" and \" form, got {and_mods:?}"
+    );
+    let and_removals = and_mods
+        .iter()
+        .filter(|m| matches!(m, ContinuousModification::RemoveKeyword { .. }))
+        .count();
+    assert_eq!(
+        and_removals, 2,
+        "the \" and \" conjunction must remove BOTH keywords, got {and_mods:?}"
+    );
+}
+
+/// End-to-end (Urborg): the second activated ability
+/// "{T}: Target creature loses first strike or swampwalk until end of turn."
+/// CR 608.2d + CR 613.1f: the " or "-joined loss list is a player CHOICE — the
+/// target loses only the ONE chosen ability, NOT both. It must parse to the
+/// two-step persisted-choice path (never to two unconditional removals):
+///   head  = `Effect::Choose { ChoiceType::Keyword { options: [First Strike,
+///           Swampwalk], count: 1 } }` (controller picks; pick persists on the
+///           source), and
+///   apply = a `sub_ability` `GenericEffect` binding a single
+///           `RemoveChosenKeyword` to the targeted creature (`ParentTarget`) for
+///           `UntilEndOfTurn`.
+/// The runtime that a creature holding BOTH abilities loses only the chosen one
+/// is proven by `layers::tests::test_remove_chosen_keyword_strips_only_chosen_landwalk_variant`.
+#[test]
+fn urborg_loses_first_strike_or_swampwalk_parses_end_to_end() {
+    use crate::types::ability::{ChoiceType, Duration};
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "{T}: Add {B}.\n{T}: Target creature loses first strike or swampwalk until end of turn.",
+        "Urborg",
+        &[],
+        &[],
+        &[],
+    );
+    // Two activated abilities: the mana ability and the keyword-loss ability.
+    assert_eq!(
+        parsed.abilities.len(),
+        2,
+        "expected two activated abilities"
+    );
+    let loss = &parsed.abilities[1];
+
+    // Head: the controller chooses exactly ONE of the two listed keywords.
+    let Effect::Choose {
+        choice_type: ChoiceType::Keyword { options, count },
+        ..
+    } = &*loss.effect
+    else {
+        panic!("expected a Choose(Keyword) head, got {:?}", loss.effect);
+    };
+    assert_eq!(
+        *count, 1,
+        "exactly one keyword is chosen (loses only the chosen ability)"
+    );
+    assert!(
+        options.contains(&Keyword::FirstStrike)
+            && options.contains(&Keyword::Landwalk("Swamp".to_string())),
+        "the choice options must be exactly the two listed keywords, got {options:?}"
+    );
+    assert_eq!(
+        options.len(),
+        2,
+        "exactly the two listed options, got {options:?}"
+    );
+
+    // Apply half: a sub_ability GenericEffect that removes the CHOSEN keyword
+    // from the targeted creature for the parsed duration.
+    let apply = loss
+        .sub_ability
+        .as_ref()
+        .expect("the choice must carry a RemoveChosenKeyword apply sub-ability");
+    let Effect::GenericEffect {
+        static_abilities,
+        duration,
+        target,
+    } = &*apply.effect
+    else {
+        panic!(
+            "expected a GenericEffect apply half, got {:?}",
+            apply.effect
+        );
+    };
+    assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
+    assert!(
+        matches!(target, Some(TargetFilter::Typed(tf)) if tf.type_filters.contains(&TypeFilter::Creature)),
+        "must target a creature, got {target:?}"
+    );
+    assert_eq!(static_abilities.len(), 1, "one keyword-loss static");
+    let mods = &static_abilities[0].modifications;
+    assert_eq!(
+        mods.as_slice(),
+        &[ContinuousModification::RemoveChosenKeyword],
+        "the apply half must strip exactly the ONE chosen keyword (RemoveChosenKeyword), \
+         never two unconditional RemoveKeyword mods, got {mods:?}"
+    );
+    assert_eq!(
+        static_abilities[0].affected,
+        Some(TargetFilter::ParentTarget),
+        "the chosen-keyword removal must bind to the targeted creature"
+    );
+}
+
+/// Regression (maintainer parse-diff, PR #4902): Arcane Lighthouse.
+///
+/// "Until end of turn, creatures your opponents control lose hexproof and
+/// shroud and can't have hexproof or shroud." The keyword-loss path splits the
+/// clause on " and " into `hexproof`, `shroud`, and the rider
+/// `can't have hexproof or shroud`. The " or " split introduced for Urborg
+/// ("loses first strike or swampwalk") must NOT fire on that rider: its
+/// trailing `shroud` maps to a keyword, so an unconditional split would emit a
+/// SECOND, duplicate `RemoveKeyword(Shroud)` — three removals instead of two.
+/// The rider ("can't have …") carries no removal of its own here; it is handled
+/// on its own path. Assert EXACTLY one Hexproof removal + one Shroud removal.
+#[test]
+fn arcane_lighthouse_lose_and_cant_have_or_rider_no_duplicate_removal() {
+    let mods = parse_continuous_modifications(
+        "lose hexproof and shroud and can't have hexproof or shroud",
+    );
+    let removals: Vec<_> = mods
+        .iter()
+        .filter(|m| matches!(m, ContinuousModification::RemoveKeyword { .. }))
+        .collect();
+    assert!(
+        mods.contains(&ContinuousModification::RemoveKeyword {
+            keyword: Keyword::Hexproof,
+        }),
+        "expected RemoveKeyword(Hexproof), got {mods:?}"
+    );
+    assert!(
+        mods.contains(&ContinuousModification::RemoveKeyword {
+            keyword: Keyword::Shroud,
+        }),
+        "expected RemoveKeyword(Shroud), got {mods:?}"
+    );
+    // The load-bearing assertion: NO duplicate Shroud from the "can't have
+    // hexproof or shroud" rider being mis-split on " or ". Exactly two removals.
+    assert_eq!(
+        removals.len(),
+        2,
+        "expected exactly two RemoveKeyword mods (one Hexproof, one Shroud) — the \
+         \"can't have hexproof or shroud\" rider must NOT add a duplicate Shroud; got {mods:?}"
+    );
+    let shroud_count = removals
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                ContinuousModification::RemoveKeyword {
+                    keyword: Keyword::Shroud
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        shroud_count, 1,
+        "Shroud must be removed exactly once, got {mods:?}"
+    );
+}

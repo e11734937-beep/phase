@@ -2921,6 +2921,109 @@ fn build_keyword_choice_clause(
     })
 }
 
+/// CR 608.2d + CR 613.1f: Parse the disjunctive keyword-LOSS list of a
+/// "[subject] loses A or B [or C ...] [until end of turn]" clause (Urborg /
+/// Phyrexian Splicer) into its typed `Keyword` option list plus any trailing
+/// duration.
+///
+/// CR 613.1f applies ability-removal at Layer 6, but CR 608.2d makes the " or "
+/// connective a player CHOICE: "loses first strike or swampwalk" removes only
+/// the ONE ability the controller picks, not both. This is the removal mirror
+/// of `parse_keyword_choice_grant` (the additive "gain your choice of A or B"
+/// form) — but here the connective is a bare " or " WITHOUT a "your choice of"
+/// lead-in, so the whole " or "/Oxford-comma list is the option set.
+///
+/// The list is split by the shared `try_parse_keyword_choice` combinator (the
+/// same N-ary disjunction grammar the "choose A, B, or C" recognizer uses),
+/// which returns `None` unless EVERY item maps to a real keyword. That rejection
+/// is load-bearing: a non-keyword tail such as Arcane Lighthouse's "can't have
+/// hexproof or shroud" rider never reaches this recognizer (it is not a bare
+/// "loses <list>" clause), and any " or " phrase whose members are not all
+/// keywords declines here and falls through to the generic path.
+///
+/// Requires >= 2 options (a single keyword is the plain remove path, not a
+/// choice). Returns `None` for the " and " conjunction (genuine remove-ALL) so
+/// it stays on the `parse_continuous_modifications` path unchanged.
+fn parse_lose_keyword_choice(predicate: &str) -> Option<(Vec<Keyword>, Option<Duration>)> {
+    // CR 613.1f: only the "lose"/"loses" verb frame — never "gain"/"has".
+    let lower = predicate.to_lowercase();
+    let (list_lower, _) = alt((tag::<_, _, OracleError<'_>>("loses "), tag("lose ")))
+        .parse(lower.as_str())
+        .ok()?;
+    // Recover the original-case slice at the same offset so keyword mapping and
+    // duration stripping see canonical text (`to_lowercase` preserves byte
+    // length for the ASCII verb prefix, so the offset aligns 1:1).
+    let offset = predicate.len() - list_lower.len();
+    let list_original = &predicate[offset..];
+    let (keyword_text, duration) = super::strip_trailing_duration(list_original);
+    let keyword_text = keyword_text.trim().trim_end_matches('.').trim();
+    // The " and " conjunction is a genuine remove-ALL — decline so it stays on
+    // the unconditional `RemoveKeyword` path in `parse_continuous_modifications`.
+    if nom_primitives::scan_contains(&keyword_text.to_lowercase(), " and ") {
+        return None;
+    }
+    // Reuse the shared " or "/Oxford-comma keyword-enumeration combinator; it
+    // yields `Some` only when EVERY item is a real keyword and there are >= 2.
+    let options = super::try_parse_keyword_choice(keyword_text)?;
+    if options.len() < 2 {
+        return None;
+    }
+    Some((options, duration.or(Some(Duration::UntilEndOfTurn))))
+}
+
+/// CR 608.2d + CR 613.1f: Build the two-step choose->remove clause for a
+/// "[target] loses A or B [until end of turn]" disjunctive keyword loss
+/// (Urborg). The head `Effect::Choose { ChoiceType::Keyword { count: 1 } }`
+/// prompts the controller and persists the picked keyword as
+/// `ChosenAttribute::Keyword` on the source; the `sub_ability`'s continuous
+/// `RemoveChosenKeyword` reads that stored keyword at Layer 6 and strips exactly
+/// the one chosen ability from the target (CR 702.14: the parameterized landwalk
+/// variant is matched precisely, so a creature with both first strike and
+/// swampwalk loses only the chosen one).
+///
+/// Structurally mirrors `try_parse_become_choice`'s Choose -> GenericEffect(apply)
+/// shape: the head is the choice, the `sub_ability` GenericEffect binds the
+/// removal to `ParentTarget` (the targeted creature) for the parsed duration.
+fn build_lose_keyword_choice_clause(
+    application: &SubjectApplication,
+    predicate: &str,
+) -> Option<ParsedEffectClause> {
+    use crate::types::ability::{ChoiceType, TargetSelectionMode};
+
+    let (options, duration) = parse_lose_keyword_choice(predicate)?;
+    let affected = static_affected_for_application(application);
+
+    // Apply half: strip exactly the chosen keyword from the target at Layer 6.
+    let apply_effect = Effect::GenericEffect {
+        static_abilities: vec![StaticDefinition::continuous()
+            .affected(affected)
+            .modifications(vec![ContinuousModification::RemoveChosenKeyword])
+            .description(predicate.to_string())],
+        duration: duration.clone(),
+        target: application.target.clone(),
+    };
+    let mut apply = AbilityDefinition::new(AbilityKind::Spell, apply_effect);
+    apply.duration = duration.clone();
+    let sub_ability = Some(Box::new(apply));
+
+    // Head: the controller chooses one of the listed keywords; the pick persists
+    // on the source so the `RemoveChosenKeyword` apply-half can read it.
+    Some(ParsedEffectClause {
+        effect: Effect::Choose {
+            choice_type: ChoiceType::Keyword { options, count: 1 },
+            persist: true,
+            selection: TargetSelectionMode::Chosen,
+        },
+        duration,
+        sub_ability,
+        distribute: None,
+        multi_target: application.multi_target.clone(),
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
 fn build_continuous_clause(
     application: SubjectApplication,
     predicate: &str,
@@ -2969,6 +3072,19 @@ fn build_continuous_clause(
     }
 
     if let Some(clause) = build_keyword_choice_clause(&application, &normalized) {
+        return Some(clause);
+    }
+
+    // CR 608.2d + CR 613.1f: "[target] loses A or B [or C ...] [until end of
+    // turn]" — the disjunctive keyword-LOSS form (Urborg: "Target creature
+    // loses first strike or swampwalk until end of turn"). Unlike the " and "
+    // conjunction (a genuine remove-ALL, handled by `parse_continuous_modifications`
+    // below), " or " here is a player CHOICE — the target loses only the ONE
+    // chosen keyword — so route it through the persisted `ChoiceType::Keyword
+    // { count: 1 }` + `RemoveChosenKeyword` machinery. Checked before the
+    // generic continuous fallthrough so the choice form is never flattened into
+    // unconditional removals.
+    if let Some(clause) = build_lose_keyword_choice_clause(&application, &normalized) {
         return Some(clause);
     }
 

@@ -1428,7 +1428,17 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
         }
     }
 
-    // CR 702: "lose [keyword]" / "loses [keyword]" — keyword removal.
+    // CR 613.1f: "lose [keyword]" / "loses [keyword]" — keyword removal. The
+    // shared `split_keyword_list` splits the " and " / Oxford-comma conjunction
+    // ("loses flying and first strike" — a genuine remove-ALL), mapping each
+    // conjunct to its own `RemoveKeyword`. The " or "-joined disjunctive loss
+    // form is deliberately NOT handled here: "loses A or B" is a player CHOICE
+    // (CR 608.2d) — the target loses only the CHOSEN one — and is routed through
+    // the persisted `ChoiceType::Keyword { count: 1 }` + `RemoveChosenKeyword`
+    // path by `build_lose_keyword_choice_clause` in the effect parser BEFORE this
+    // building block runs. Because `split_keyword_list` leaves the whole
+    // "A or B" phrase intact and `map_keyword` rejects it, the disjunctive form
+    // simply yields no removal here (any real routing already happened upstream).
     if let Some(keyword_text) = extract_lose_keyword_clause(&unquoted_text) {
         for part in split_keyword_list(keyword_text.trim().trim_end_matches('.')) {
             if let Some(kw) = map_keyword(part.trim().trim_end_matches('.')) {
